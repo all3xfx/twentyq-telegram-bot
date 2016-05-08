@@ -1,18 +1,19 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+import re
 import logging
 import requests
 import postgresql
 from bs4 import BeautifulSoup
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, \
-    ParseMode, ChatAction
+    Emoji, ParseMode, ChatAction
 from telegram.ext import Updater, CommandHandler, MessageHandler, \
     CallbackQueryHandler, Filters
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - '
                            '%(message)s',
-                    level=logging.DEBUG)
+                    level=logging.INFO)
 
 # Open connection to PostgreSQL database
 db = postgresql.open("pq://USER:PASS@HOST/DATABASE")
@@ -28,11 +29,12 @@ TWENTY_QUESTIONS_HOME_URL = "http://www.20q.net"
 TWENTY_QUESTIONS_DATA_URL = "http://y.20q.net"
 TWENTY_QUESTIONS_LOC = "/gsq-enUK"
 ADMIN_USER_NAME = '@zachd'
-VALID_OPTIONS = ['Animal', 'Vegetable', 'Mineral',
-                'Other', 'Unknown', '?',
-                'Yes','No','Unknown',
-                'Irrelevant','Sometimes','Partly',
-                'Right', 'Wrong', 'Close']
+VALID_OPTION = re.compile("^[\w\?]+$")
+VALID_LANGUAGES = [('English (US)', 'us'), ('English (UK)', 'gb'), ('English (CA)', 'ca'),
+('Deutsch', 'de'), ('Français', 'fr'), ('Español', 'es'), ('Italiano', 'en'), ('國語', 'zh'),
+('廣東話', 'zhgb'), ('Nederlands', 'nl'), ('日本語', 'jp'), ('Dansk', 'dk'), ('Magyar', 'hu'),
+('Čeština', 'cs'), ('Ελληνικά', 'el'), ('Svenska', 'se'), ('Polski', 'pl'), ('Português', 'pt'),
+('한국어', 'ko'), ('Suomi', 'fi'), ('Türkçe', 'tr'), ('Norsk', 'no')]
 
 #Answer question function
 def answer_q(bot, update):
@@ -49,11 +51,13 @@ def answer_q(bot, update):
         "that most people would know about, but not a proper noun or a specific person, " \
         "place, or thing.\n\nChoose a category in the message above that best describes what you're thinking."
         send_message(bot, help_text, chat_id)
+        return True
 
-    elif query.data in ['start', 'restart']:
+    elif query.data in ['start', 'Play Again']:
         answer_callback(bot, query.id, "Great! Let's play" + 
-            (" again." if query.data == 'restart' else "."))
-        start_game(bot, query)
+            (" again." if query.data == 'Play Again' else "."))
+        start_game(bot, query, True)
+        return True
 
     # Check if the request came from a valid user
     if not current_user:
@@ -68,7 +72,7 @@ def answer_q(bot, update):
         answer_callback(bot, query.id, "Alright! Here are hints from your last game.")
         hints(bot, query, current_user)
 
-    elif query.data in VALID_OPTIONS:
+    elif VALID_OPTION.match(query.data):
 
         # Modify previous message
         bot.editMessageText(text=query.message.text + "\nYou answered: _" + query.data + "_", 
@@ -91,12 +95,12 @@ def answer_q(bot, update):
             # Get hints section
             try:
                 raw_hints = soup.find('td').text.split('\n')[6].split('.')[:-5]
-                hints = '\n'.join(raw_hints)
+                hints_str = '\n'.join(raw_hints)
             except:
-                hints = 'No hints available!'
+                hints_str = 'No hints available!'
 
             # Create response keyboard
-            keyboard_buttons = [[InlineKeyboardButton('Play Again', callback_data='restart'),
+            keyboard_buttons = [[InlineKeyboardButton('Play Again', callback_data='Play Again'),
                                 InlineKeyboardButton('Visit 20Q', url='http://20q.net')],
                                [InlineKeyboardButton('Show Stats', callback_data='stats'),
                                 InlineKeyboardButton('Show Hints', callback_data='hints')]]
@@ -104,11 +108,19 @@ def answer_q(bot, update):
 
             # Send message dependant on result
             if h2s[0].string == "20Q won!":
-                send_message(bot, "20Q won! Play again?", chat_id, custom_keyboard)
-                update_stats(user_id, current_user['wins'] + 1, current_user['losses'], hints)
+                send_message(bot, "*" + h2s[0].string + "*", chat_id, custom_keyboard)
+                update_stats(user_id, current_user['wins'] + 1, current_user['losses'], hints_str)
+            elif h2s[0].string == "You won!":
+                if soup.big.string == 'Is it one of these ...':
+                    options = soup.tr.find_all('a')
+                    custom_keyboard = get_custom_keyboard(user_id, current_user, ab)
+                    send_message(bot, h2s[0].string + " " + soup.big.string, chat_id, custom_keyboard)
+                else:
+                    send_message(bot, "*" + h2s[0].string + "*", chat_id, custom_keyboard)
+                update_stats(user_id, current_user['wins'] + 1, current_user['losses'], hints_str)
             else:
-                send_message(bot, "20Q lost. Play again?", chat_id, custom_keyboard)
-                update_stats(user_id, current_user['wins'], current_user['losses'] + 1, hints)
+                send_message(bot, "*" + h2s[0].string + "*", chat_id, custom_keyboard)
+                update_stats(user_id, current_user['wins'], current_user['losses'] + 1, hints_str)
 
         # Otherwise, send the next question
         else:
@@ -119,11 +131,15 @@ def answer_q(bot, update):
             # Send callback popup and reply message
             answer_callback(bot, query.id, "Alright! Next Question.")
             send_message(bot, question, chat_id, custom_keyboard)
+    else:
+        answer_callback(bot, query.id, "An error occured.")
+        send_message(bot, "An error occured.", chat_id)
+
 
 # Start game function
-def start_game(bot, update):
+def start_game(bot, update, restart=False):
     chat_id = update.message.chat_id
-    user = update.message.from_user
+    user = update.from_user if restart else update.message.from_user
 
     # Send the typing action
     bot.sendChatAction(chat_id=chat_id, action=ChatAction.TYPING)
@@ -168,13 +184,11 @@ def get_custom_keyboard(user_id, user, options):
     for option in options:
         choice = option.string.replace('\xa0', '').replace(' ', '')
         action = option['href'].split('?')[1]
-        if choice in VALID_OPTIONS:
-            if len(custom_keyboard[row_number]) == 3:
-                row_number += 1
-            options_list.append([choice, action])
-            custom_keyboard[row_number].append(InlineKeyboardButton(choice,
-                callback_data=choice))
-
+        if len(custom_keyboard[row_number]) == 3:
+            row_number += 1
+        options_list.append([choice, action])
+        custom_keyboard[row_number].append(InlineKeyboardButton(choice,
+            callback_data=choice))
     update_options(user_id, options_list, (user['messages'] + 1 if user else 1))
     return InlineKeyboardMarkup(custom_keyboard)
 
@@ -197,14 +211,14 @@ def stats(bot, update, user=None):
 
 def hints(bot, update, user=None, reply_markup=None):
     user = user or get_user.first(update.message.from_user.id)
-    hints = "*Game Hints*:\n" + user['hints']
+    user_hints = "*Game Hints*:\n" + ("No hints available." if user['hints'] is None else user['hints'])
     if user is None or user['hints'] is None:
-        hints = "You have no hints available. Have you played a game yet?"
+        user_hints = "You have no hints available. Have you played a game yet?"
         reply_markup = InlineKeyboardMarkup([
             [InlineKeyboardButton('Start Playing', callback_data='start')],
             [InlineKeyboardButton('How to Play', callback_data='help')]
         ])
-    send_message(bot, hints, update.message.chat_id, reply_markup)
+    send_message(bot, user_hints, update.message.chat_id, reply_markup)
 
 def help(bot, update):
     bot.sendMessage(update.message.chat_id, text="Type */start* to begin playing.",
