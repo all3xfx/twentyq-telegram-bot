@@ -20,8 +20,8 @@ db = postgresql.open("pq://USER:PASS@HOST/DATABASE")
 
 # Define some prepared SQL statements
 get_user = db.prepare("SELECT * FROM users WHERE user_id=$1")
-update_stats = db.prepare("UPDATE users SET wins=$2, losses=$3, hints=$4 WHERE user_id=$1")
-update_options = db.prepare("UPDATE users SET options=$2, messages=$3 WHERE user_id=$1")
+update_stats = db.prepare("UPDATE users SET wins=$2, losses=$3, hints=$4, question=NULL, options=NULL WHERE user_id=$1")
+update_options = db.prepare("UPDATE users SET question=$2, options=$3, messages=$4 WHERE user_id=$1")
 create_user = db.prepare("INSERT INTO users (user_id, user_name) VALUES (CAST($1 AS INT), $2)")
 
 # Set some defaults
@@ -46,10 +46,9 @@ def answer_q(bot, update):
     # User independant callback actions
     if query.data in ['?', 'help']:
         answer_callback(bot, query.id, "Confused? Here's how to play.")
-        help_text = "*Playing 20Q*\nThink of something and 20Q will read your mind by " \
-        "asking a few simple questions. The object you think of should be something " \
-        "that most people would know about, but not a proper noun or a specific person, " \
-        "place, or thing.\n\nChoose a category in the message above that best describes what you're thinking."
+        start_page = get_start_page(TWENTY_QUESTIONS_DATA_URL, TWENTY_QUESTIONS_LOC)
+        help_text = start_page.find_all('big')[0].text.replace('\xa0', '') + "\n" \
+            + start_page.find_all('big')[3].text + start_page.find_all('br')[3].text.replace('\xa0', '') 
         send_message(bot, help_text, chat_id)
         return True
 
@@ -61,7 +60,7 @@ def answer_q(bot, update):
 
     # Check if the request came from a valid user
     if not current_user:
-        return error(bot, query, "Invalid User", True)
+        return error(bot, query, "This game has ended.")
 
     # User dependant callback actions
     if query.data == 'stats':
@@ -113,7 +112,7 @@ def answer_q(bot, update):
             elif h2s[0].string == "You won!":
                 if soup.big.string == 'Is it one of these ...':
                     options = soup.tr.find_all('a')
-                    custom_keyboard = get_custom_keyboard(user_id, current_user, ab)
+                    custom_keyboard = get_custom_keyboard(user_id, current_user, options)
                     send_message(bot, h2s[0].string + " " + soup.big.string, chat_id, custom_keyboard)
                 else:
                     send_message(bot, "*" + h2s[0].string + "*", chat_id, custom_keyboard)
@@ -125,15 +124,15 @@ def answer_q(bot, update):
         # Otherwise, send the next question
         else:
             options = soup.big.find_all('a')
-            question = soup.big.b.text.split('\n')[0].replace('\xa0', '')
-            custom_keyboard = get_custom_keyboard(user_id, current_user, options)
+            question = soup.big.text.split('\n')[0].replace('\xa0', '')
+            custom_keyboard = get_custom_keyboard(user_id, current_user, options, question)
 
             # Send callback popup and reply message
             answer_callback(bot, query.id, "Alright! Next Question.")
             send_message(bot, question, chat_id, custom_keyboard)
     else:
         answer_callback(bot, query.id, "An error occured.")
-        send_message(bot, "An error occured.", chat_id)
+        return error(bot, query, "Invalid option.")
 
 
 # Start game function
@@ -146,51 +145,60 @@ def start_game(bot, update, restart=False):
 
     # Get user state from database
     current_user = get_user.first(user.id)
+
     if not current_user:
         create_user(user.id, user.name)
 
-    # Get start game singup page
+    if current_user['options']:
+        send_message(bot, "You're already playing a game!\nHere's the current question. Wanna /restart?\n\n"
+             + current_user['question'], chat_id, None)
+        return True
+
+    start_page = get_start_page(TWENTY_QUESTIONS_DATA_URL, TWENTY_QUESTIONS_LOC)
+
+    # Sort through options
+    options = start_page.find_all('a', {'target': 'mainFrame'})
+    question = start_page.find_all('big')[2].text.split('\n')[0].replace('\xa0', '')
+    custom_keyboard = get_custom_keyboard(user.id, current_user, options, question)
+
+    # Reply to user
+    send_message(bot, "*20Q can read you mind.* Let's go!\n\n" + question, chat_id, custom_keyboard)
+
+
+# Helper Functions
+def get_custom_keyboard(user_id, user, options, question=None, just_options=False):
+    custom_keyboard = [[]]
+    options_list = []
+    row_number = 0
+
+    for opt in options:
+        choice = opt.string.replace('\xa0', '')
+        action = opt['href'].split('?')[1]
+        # Special case to remove "Probably", "Doubtful", and "Usually"
+        if not (question and options.index(opt) >= 7 and options.index(opt) <= 9):
+            if len(custom_keyboard[row_number]) == 3:
+                row_number += 1
+                custom_keyboard.append([])
+            options_list.append([choice, action])
+            custom_keyboard[row_number].append(InlineKeyboardButton(choice,
+                callback_data=choice))
+    update_options(user_id, question, options_list, (user['messages'] + 1 if user else 1))
+    return InlineKeyboardMarkup(custom_keyboard)
+
+# Get start game singup page
+def get_start_page(data_url, location_url):
     headers = {'Referer': TWENTY_QUESTIONS_HOME_URL + '/play.html'}
-    resp = requests.get(TWENTY_QUESTIONS_DATA_URL + TWENTY_QUESTIONS_LOC, headers=headers)
+    resp = requests.get(data_url + location_url, headers=headers)
     soup = BeautifulSoup(resp.content, 'html.parser')
     start_key = soup.form['action']
 
     # Click Play button on signup page
-    headers = {'Referer': TWENTY_QUESTIONS_DATA_URL + TWENTY_QUESTIONS_LOC}
+    headers = {'Referer': data_url + location_url}
     form = {
-        'age': '',
-        'cctkr': 'IE,GB,FR,NL,HU,US,RO,AE',
         'submit': 'Play'
     }
-    resp = requests.post(TWENTY_QUESTIONS_DATA_URL + start_key, data=form, headers=headers)
-    soup = BeautifulSoup(resp.content, 'html.parser')
-
-    # Sort through options
-    options = soup.find_all('a', {'target': 'mainFrame'})
-    custom_keyboard = get_custom_keyboard(user.id, current_user, options)
-
-    # Reply to user
-    send_message(bot, "*20Q can read you mind.* Let's go!\n\n" \
-                    "Q1. Is it classified as Animal, Vegetable or Mineral?",
-                    chat_id, custom_keyboard)
-
-
-# Helper Functions
-def get_custom_keyboard(user_id, user, options):
-    custom_keyboard = [[], []]
-    options_list = []
-    row_number = 0
-
-    for option in options:
-        choice = option.string.replace('\xa0', '').replace(' ', '')
-        action = option['href'].split('?')[1]
-        if len(custom_keyboard[row_number]) == 3:
-            row_number += 1
-        options_list.append([choice, action])
-        custom_keyboard[row_number].append(InlineKeyboardButton(choice,
-            callback_data=choice))
-    update_options(user_id, options_list, (user['messages'] + 1 if user else 1))
-    return InlineKeyboardMarkup(custom_keyboard)
+    resp = requests.post(data_url + start_key, data=form, headers=headers)
+    return BeautifulSoup(resp.content, 'html.parser')
 
 def answer_callback(bot, query_id, text):
     bot.answerCallbackQuery(query_id, text=text)
@@ -224,11 +232,9 @@ def help(bot, update):
     bot.sendMessage(update.message.chat_id, text="Type */start* to begin playing.",
      parse_mode=ParseMode.MARKDOWN)
 
-def error(bot, update, error, show_error=False):
+def error(bot, update, error_text="Something went wrong!"):
     logging.warning('Update "%s" caused error "%s"' % (update, error))
-    if show_error:
-        answer_callback(bot, query.id, "Oops! This game has ended.")
-        send_message(bot, "Sorry, this game has ended. Please type */start*.", chat_id)
+    send_message(bot, "*Error*: " + error_text, chat_id)
     return True
 
 def admin_pdb(bot, update):
