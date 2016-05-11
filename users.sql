@@ -11,7 +11,11 @@ SET client_encoding = 'UTF8';
 CREATE TABLE users (
     user_id bigint NOT NULL,
     user_name text,
+    question text,
     options text[],
+    answer text,
+    gametype text,
+    language text,
     hints text,
     wins integer DEFAULT 0,
     losses integer DEFAULT 0,
