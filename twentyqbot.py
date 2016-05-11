@@ -20,22 +20,27 @@ db = postgresql.open("pq://USER:PASS@HOST/DATABASE")
 
 # Define some prepared SQL statements
 get_user = db.prepare("SELECT * FROM users WHERE user_id=$1")
-set_lang = db.prepare("UPDATE users SET language=$2 WHERE user_id=$1")
+set_lang_game = db.prepare("UPDATE users SET language=$2, gametype=$3 WHERE user_id=$1")
 update_stats = db.prepare("UPDATE users SET wins=$2, losses=$3, hints=$4, answer=$5, question=NULL WHERE user_id=$1")
 update_options = db.prepare("UPDATE users SET question=$2, options=$3, messages=$4 WHERE user_id=$1")
 create_user = db.prepare("INSERT INTO users (user_id, user_name) VALUES (CAST($1 AS INT), $2)")
 
 # Set some defaults
-TWENTY_QUESTIONS_HOME_URL = "http://www.20q.net"
-TWENTY_QUESTIONS_DATA_URL = "http://y.20q.net"
-TWENTY_QUESTIONS_LOC = "/gsq-"
+TWENTY_QUESTIONS_URL = "20q.net"
 UNICODE_OFFSET = ord('🇦') - ord('A')
 VALID_OPTION = re.compile("^[\w\?\s]+$")
 ADMIN_USER_NAME = '@zachd'
 BUTTONS_PER_ROW = 3
 
-# Set valid language list
-VALID_LANGUAGES = [('English (US)', 'US', 'en'), ('English (UK)', 'GB', 'gb'), ('English (CA)', 'CA', 'ca'),
+# Set valid gametypes
+DEFAULT_GAMETYPE = 'y'
+VALID_GAMETYPES = [('Classic', 'y'), ('Star Wars', 'starwars'), ('Disney', 'disney'), ('The Simpsons', 'thomp'),
+('Star Trek', 'trek'), ('Doctor Who', 'what'), ('20Q Earth', 'place'), ('20Q Movies', 'movies'), ('20Q TV', 'tv'),
+('20Q People', 'people'), ('20Q Sports', 'sports'), ('20Q Music', 'music'), ('20Q Name Game', 'names')]
+
+# Set valid languages
+DEFAULT_LANGUAGE = 'en'
+VALID_LANGUAGES = [('English (US)', 'US', 'en'), ('English (UK)', 'GB', 'enUK'), ('English (CA)', 'CA', 'enCA'),
 ('Français', 'FR', 'fr'), ('Deutsch', 'DE', 'de'), ('Español', 'ES', 'es'), ('Italiano', 'IT', 'it'), ('Nederlands', 'NL', 'nl'), 
 ('Português', 'PT', 'pt'), ('Dansk', 'DK', 'dk'), ('Polski', 'PL', 'pl'), ('Norsk', 'NO', 'no'), ('Svenska', 'SE', 'se'), 
 ('Čeština', 'CZ', 'cs'), ('Ελληνικά', 'GR', 'el'), ('Türkçe', 'TR', 'tr'), ('Magyar', 'HU', 'hu'), ('Suomi', 'FI', 'fi'), 
@@ -48,32 +53,39 @@ def answer_q(bot, update):
     user_id = query.from_user.id
     current_user = get_user.first(user_id)
 
+    # Check if the request came from a valid user
+    if not current_user:
+        return error(bot, query, "An error occured. Try /start?", from_query=True)
+
     # User independant callback actions
     if query.data == '?':
-        answer_callback(bot, query.id, "Confused? Here's how to play.")
-        help(bot, query, current_user)
-        return True
+        answer_callback(bot, query.id, "Need some help?")
+        cmd_help(bot, query, current_user)
 
     elif query.data in ['start', 'Play Again']:
         answer_callback(bot, query.id, "Great! Let's play" + 
             (" again." if query.data == 'Play Again' else "."))
-        start_game(bot, query, from_query=True)
-        return True
+        cmd_start(bot, query, from_query=True)
 
-    # Check if the request came from a valid user
-    if not current_user:
-        return error(bot, query, "This game has ended.")
-
-    # User dependant callback actions
-    if query.data == 'stats':
+    elif query.data == 'stats':
         answer_callback(bot, query.id, "Alright! Here are your play stats.")
-        stats(bot, query, current_user)
+        cmd_stats(bot, query, current_user)
 
     elif query.data == 'hints':
         answer_callback(bot, query.id, "Alright! Here are hints from your last game.")
-        hints(bot, query, current_user)
+        cmd_hints(bot, query, current_user)
+
+    elif query.data == 'language':
+        answer_callback(bot, query.id, "Alright! Select a new language below.")
+        cmd_language(bot, query, current_user)
+
+    elif query.data == 'gametype':
+        answer_callback(bot, query.id, "Alright! Select a new game type below.")
+        cmd_gametype(bot, query, current_user)
 
     elif VALID_OPTION.match(query.data):
+
+        (gametype, _, language) = get_game_lang(current_user)
 
         # Modify previous message
         bot.editMessageText(text=query.message.text + "\nYou answered: _" + query.data + "_", 
@@ -82,24 +94,27 @@ def answer_q(bot, update):
 
         # Get action from options list in database
         options_list = current_user['options'].nest()
-        action = next(action for [choice, action] in options_list if choice == query.data)
+        try:
+            action = next(action for [choice, action] in options_list if choice == query.data)
+        except StopIteration:
+            return error(bot, query, "This game has ended.", from_query=True)
 
         # Get result of selected action
-        language = user['language'] or 'en'
-        headers = {'Referer': TWENTY_QUESTIONS_DATA_URL + TWENTY_QUESTIONS_LOC + language}
-        resp = requests.get(TWENTY_QUESTIONS_DATA_URL + TWENTY_QUESTIONS_LOC + language + '?' 
+        headers = {'Referer': 'http://' + gametype + '.' + TWENTY_QUESTIONS_URL + language}
+        resp = requests.get('http://' + gametype + '.' + TWENTY_QUESTIONS_URL + language + '?' 
                                 + action, headers=headers)
         soup = BeautifulSoup(resp.content, 'html.parser')
 
         # Check if the game is over
         h2s = soup.find_all('h2')
         if h2s:
+
             # Get hints section
             try:
                 raw_hints = soup.find('td').text.split('\n')[6].split('.')[:-5]
-                hints_str = '\n'.join(raw_hints)
+                hints = '\n'.join(raw_hints)
             except:
-                hints_str = 'No hints available!'
+                hints = 'No hints available!'
 
             # Create response keyboard
             keyboard_buttons = [[InlineKeyboardButton('Play Again', callback_data='Play Again'),
@@ -108,7 +123,6 @@ def answer_q(bot, update):
                                 InlineKeyboardButton('Show Hints', callback_data='hints')]]
             custom_keyboard = InlineKeyboardMarkup(keyboard_buttons)
 
-            # Send message depending on game result
             first_answer = action == options_list[0][1]
             if current_user['question']:
                 question_num = int(current_user['question'][1:3].replace('.', ''))
@@ -116,7 +130,7 @@ def answer_q(bot, update):
             # If 20Q was right in less than 20 questions
             if first_answer and question_num and question_num <= 20:
                 send_message(bot, "*" + h2s[0].string + "*", chat_id, custom_keyboard)
-                update_stats(user_id, current_user['wins'] + 1, current_user['losses'], hints_str, soup.big.string)
+                update_stats(user_id, current_user['wins'] + 1, current_user['losses'], hints, soup.big.string)
             else:
                 answer = None
                 inputs = soup.find_all('input')
@@ -128,7 +142,7 @@ def answer_q(bot, update):
                     answer = soup.big.string
                     send_message(bot, "*" + h2s[0].string + "*", chat_id, custom_keyboard)
                 if current_user['question']:
-                    update_stats(user_id, current_user['wins'], current_user['losses'] + 1, hints_str, answer)
+                    update_stats(user_id, current_user['wins'], current_user['losses'] + 1, hints, answer)
 
         # Otherwise, send the next question
         else:
@@ -145,7 +159,7 @@ def answer_q(bot, update):
 
 
 # Start game function
-def start_game(bot, update, from_query=False, restart=False):
+def cmd_start(bot, update, from_query=False, restart=False):
     chat_id = update.message.chat_id
     user = update.from_user if from_query else update.message.from_user
 
@@ -165,54 +179,72 @@ def start_game(bot, update, from_query=False, restart=False):
              + current_user['question'], chat_id, InlineKeyboardMarkup(custom_keyboard))
         return True
 
-    language = current_user['language'] if current_user and current_user['language'] else 'en'
-    start_page = get_start_page(TWENTY_QUESTIONS_DATA_URL, TWENTY_QUESTIONS_LOC + language)
+    start_page = get_start_page(bot, current_user, chat_id)
 
     # Sort through options
     options = start_page.find_all('a', {'target': 'mainFrame'})
-    question = clean_input(start_page.find_all('big')[2].text.split('\n')[0])
+    intro_text = clean_input(start_page.table.p.big.text.replace('A.I.', 'AI').replace('. ', '.*\n', 1))
+    question = clean_input(start_page.table.td.td.find_all('big', recursive=False)[0].text.split('\n')[0])
     custom_keyboard = get_custom_keyboard(user.id, current_user, options, question)
 
     # Reply to user
-    send_message(bot, "*20Q can read you mind.* Let's go!\n\n" + question, chat_id, custom_keyboard)
+    send_message(bot, "*" + intro_text + "\n\n" + question, chat_id, custom_keyboard)
 
 
 # Helper Functions
 def get_custom_keyboard(user_id, user, options, question=None, just_options=False):
     custom_keyboard = [[]]
     options_list = []
+    row_num = 2 if len(options) == 5 else BUTTONS_PER_ROW
     row_number = 0
 
     for opt in options:
         choice = clean_input(opt.string)
         action = opt['href'].split('?')[1]
+
         # Special case to remove "Probably", "Doubtful", and "Usually" (unnecessary)
-        if not (question and options.index(opt) >= 7 and options.index(opt) <= 9):
-            if len(custom_keyboard[row_number]) == BUTTONS_PER_ROW:
+        if not (question and options.index(opt) >= 7 and options.index(opt) <= 9) \
+                and not (row_num == 2 and choice == '?'):
+            if len(custom_keyboard[row_number]) == row_num:
                 row_number += 1
                 custom_keyboard.append([])
             options_list.append([choice, action])
             custom_keyboard[row_number].append(InlineKeyboardButton(choice,
                 callback_data=choice))
+
     update_options(user_id, question, options_list, (user['messages'] + 1 if user else 1))
     return InlineKeyboardMarkup(custom_keyboard)
 
-def get_start_page(data_url, location_url):
-    headers = {'Referer': TWENTY_QUESTIONS_HOME_URL + '/play.html'}
-    resp = requests.get(data_url + location_url, headers=headers)
+def get_start_page(bot, user, chat_id):
+    (gametype, _, language) = get_game_lang(user)
+    data_url = 'http://' + gametype + '.' + TWENTY_QUESTIONS_URL
+
+    # Request signup page for selected game
+    headers = {'Referer': 'http://' + TWENTY_QUESTIONS_URL + '/play.html'}
+    resp = requests.get(data_url + language, headers=headers)
     soup = BeautifulSoup(resp.content, 'html.parser')
     start_key = soup.form['action']
 
     # Click Play button on signup page
-    headers = {'Referer': data_url + location_url}
-    form = {
-        'submit': 'Play'
-    }
+    headers = {'Referer': data_url + language}
+    form = {'submit': 'Play'}
     resp = requests.post(data_url + start_key, data=form, headers=headers)
+
+    # Send an image for selected game types
+    if gametype in ['starwars', 'trek', 'thomp', 'disney', 'what']:
+        bot.sendChatAction(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
+        bot.sendPhoto(chat_id=chat_id, photo=open('assets/' + gametype + '.png', 'rb'))
+
     return BeautifulSoup(resp.content, 'html.parser')
 
-# http://schinckel.net/2015/10/29/unicode-flags-in-python/
+def get_game_lang(user):
+    game = user['gametype'] if user and user['gametype'] else DEFAULT_GAMETYPE
+    lang = user['language'] if user and user['language'] else DEFAULT_LANGUAGE
+    full_lang = '/gsq-' + lang if game == DEFAULT_GAMETYPE else '/gse'
+    return (game, lang, full_lang)
+
 def get_unicode_flag(code):
+    # http://schinckel.net/2015/10/29/unicode-flags-in-python/
     return chr(ord(code[0]) + UNICODE_OFFSET) + chr(ord(code[1]) + UNICODE_OFFSET)
 
 def clean_input(input):
@@ -226,88 +258,104 @@ def send_message(bot, text, chat_id, reply_markup=None):
                     parse_mode=ParseMode.MARKDOWN)
 
 # Command Handlers
-def stats(bot, update, user=None, custom_keyboard=None):
+def message(bot, update):
+    user = update.message.from_user
+    updated = False
+    current_user = get_user.first(user.id)
+    (gametype, language, _) = get_game_lang(current_user)
+    for (lang, code, url) in VALID_LANGUAGES:
+        if lang == update.message.text[3:]:
+            language = url
+            updated = True
+            send_message(bot, "Language changed to " + get_unicode_flag(code) + " " + \
+                lang + ".", update.message.chat_id)
+    for (game, code) in VALID_GAMETYPES:
+        if game.lower() == update.message.text.lower():
+            gametype = code
+            updated = True
+            send_message(bot, "Gametype changed to " + game + ".", update.message.chat_id)
+    if updated:
+        set_lang_game(user.id, language, gametype)
+        cmd_restart(bot, update)
+    else:
+        bot.sendChatAction(chat_id=update.message.chat_id, action=ChatAction.UPLOAD_VIDEO)
+        send_message(bot, "*Unknown game type.*\nLooking to play 20Q? Type /start.", update.message.chat_id)
+        bot.sendVideo(chat_id=update.message.chat_id, video=open('assets/20q.mp4', 'rb'))
+
+def cmd_stats(bot, update, user=None, custom_keyboard=None):
     user = user or get_user.first(update.message.from_user.id)
-    if user is None or not user['messages']:
+    total = 0 if not user else user['wins'] + user['losses']
+    if user is None or total == 0:
         user_stats = "You have no stats available. Have you played a game yet?"
         custom_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton('Start Playing', callback_data='start')],
-            [InlineKeyboardButton('How to Play', callback_data='?')]
+            [InlineKeyboardButton('Start Playing', callback_data='start'),
+            InlineKeyboardButton('How to Play', callback_data='?')]
         ])
     else:
-        total = user['wins'] + user['losses']
         user_stats = "*Play Stats*:\n20Q Won: *" + str(user['wins']) + "*\n20Q Lost: *" + \
             str(user['losses']) + "*\nTotal games: *" + str(total) + "*\nAvg Qs/game: *" + \
             str(int(user['messages'] / (1 if total == 0 else total))) + "*"
     send_message(bot, user_stats, update.message.chat_id, custom_keyboard)
 
-def hints(bot, update, user=None, custom_keyboard=None):
+def cmd_hints(bot, update, user=None, custom_keyboard=None):
     user = user or get_user.first(update.message.from_user.id)
     if user is None or not user['hints']:
-        user_hints = "*Hints*:\nNo hints available."
-        if user['hints'] is None:
-            user_hints = "You have no hints available. Have you played a game yet?"
-            custom_keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton('Start Playing', callback_data='start')],
-                [InlineKeyboardButton('How to Play', callback_data='?')]
-            ])
+        user_hints = "You have no hints available. Have you played a game yet?"
+        custom_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton('Start Playing', callback_data='start'),
+            InlineKeyboardButton('How to Play', callback_data='?')]
+        ])
     else:
         user_hints = "*Answer*: " + user['answer'] + "\n*Hints*: " + user['hints']
     send_message(bot, user_hints, update.message.chat_id, custom_keyboard)
 
-def message(bot, update):
-    user = update.message.from_user
-    for (lang, code, url) in VALID_LANGUAGES:
-        if lang == update.message.text[3:]:
-            current_user = get_user.first(user.id) or create_user(user.id, user.name)
-            set_lang(user.id, url)
-            send_message(bot, "Language changed to " + get_unicode_flag(code) + " " + lang, \
-                update.message.chat_id)
-
-def restart(bot, update):
+def cmd_restart(bot, update):
     user_id = update.message.from_user.id
     user = get_user.first(user_id)
     if user and user['question']:
         question_num = int(user['question'][1:3].replace('.', ''))
         update_options(user_id, None, None, user['messages'] - question_num)
-    start_game(bot, update, restart=True)
+    cmd_start(bot, update, restart=True)
 
-def help(bot, update, user=None, custom_keyboard=None):
+def cmd_help(bot, update, user=None, custom_keyboard=None):
     user = user or get_user.first(update.message.from_user.id)
-    language = user['language'] if user and user['language'] else 'en'
-    start_page = get_start_page(TWENTY_QUESTIONS_DATA_URL, TWENTY_QUESTIONS_LOC + language)
+    start_page = get_start_page(bot, user, update.message.chat_id)
     help_text = "*20Q can read you mind!*\n" + clean_input(start_page.find_all('big')[0].text) + \
         "\n" + clean_input(start_page.find_all('p')[1].text) + " _" + \
         clean_input(start_page.find_all('br')[3].text) + "_"
-    if user is None or not user['question']:
-        custom_keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("Start Playing", callback_data='start')
-        ]])
+    custom_keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Change Language", callback_data='language'),
+        InlineKeyboardButton("Change Game Type", callback_data='gametype')
+    ]])
     send_message(bot, help_text, update.message.chat_id, custom_keyboard)
 
-def language(bot, update):
-    user = get_user.first(update.message.from_user.id)
-    lang = user['language'] if user and user['language'] else 'en'
-    lang_full = next(l for (l, c, u) in VALID_LANGUAGES if u == lang) if lang != 'en' else "English (US)"
+def cmd_language(bot, update, user=None):
+    user = user or get_user.first(update.message.from_user.id)
+    user_lang = user['language'] if user and user['language'] else DEFAULT_LANGUAGE
+    (lang_full, country_code) = next((l, c) for (l, c, u) in VALID_LANGUAGES if u == user_lang)
     language_buttons = [KeyboardButton(get_unicode_flag(c) + " " + l) for (l, c, p) in VALID_LANGUAGES]
     custom_keyboard = [language_buttons[i:i+2] for i in range(0, len(language_buttons), 2)]
-    send_message(bot, "Current: " + get_unicode_flag(lang) + " " + lang_full + "\nSelect a language.", \
+    send_message(bot, "Current: " + get_unicode_flag(country_code) + " " + lang_full + "\nSelect a language.", \
         update.message.chat_id, ReplyKeyboardMarkup(custom_keyboard, one_time_keyboard=True))
     return True
 
-def error(bot, update, error_text="Something went wrong!"):
-    logging.warning('Update "%s" caused error "%s"' % (update, error))
-    send_message(bot, "*Error*: " + error_text, update.message.chat_id)
+def cmd_gametype(bot, update, user=None):
+    user = user or get_user.first(update.message.from_user.id)
+    user_gametype = user['gametype'] if user and user['gametype'] else DEFAULT_GAMETYPE
+    (gametype, game_code) = next((g, c) for (g, c) in VALID_GAMETYPES if c == user_gametype)
+    gametype_buttons = [KeyboardButton(g) for (g, c) in VALID_GAMETYPES]
+    custom_keyboard = [gametype_buttons[i:i+2] for i in range(1, len(gametype_buttons), 2)]
+    custom_keyboard.insert(0, [gametype_buttons[0]])
+    send_message(bot, "Current: *" + gametype + "*\nSelect a gametype.", \
+        update.message.chat_id, ReplyKeyboardMarkup(custom_keyboard, one_time_keyboard=True))
     return True
 
-def admin_pdb(bot, update):
-    if update.message.from_user.name == ADMIN_USER_NAME:
-        import pdb; pdb.set_trace()
-
-def admin_exit(bot, update):
-    if update.message.from_user.name == ADMIN_USER_NAME:
-        updater.stop()
-
+def error(bot, update, error_text="Something went wrong!", from_query=True):
+    logging.warning('Update "%s" caused error "%s"' % (update, error))
+    if from_query:
+        answer_callback(bot, update.id, "Oops! An error occured.")
+    send_message(bot, "*Error*: " + error_text, update.message.chat_id)
+    return True
 
 # Create the Updater and pass it your bot's token.
 updater = Updater("BOT_TOKEN_HERE")
@@ -315,14 +363,13 @@ updater = Updater("BOT_TOKEN_HERE")
 # Register handler functions
 updater.dispatcher.addHandler(CallbackQueryHandler(answer_q))
 updater.dispatcher.addHandler(MessageHandler([Filters.text], message))
-updater.dispatcher.addHandler(CommandHandler('pdb', admin_pdb))
-updater.dispatcher.addHandler(CommandHandler('exit', admin_exit))
-updater.dispatcher.addHandler(CommandHandler('start', start_game))
-updater.dispatcher.addHandler(CommandHandler('restart', restart))
-updater.dispatcher.addHandler(CommandHandler('language', language))
-updater.dispatcher.addHandler(CommandHandler('stats', stats))
-updater.dispatcher.addHandler(CommandHandler('hints', hints))
-updater.dispatcher.addHandler(CommandHandler('help', help))
+updater.dispatcher.addHandler(CommandHandler('start', cmd_start))
+updater.dispatcher.addHandler(CommandHandler('restart', cmd_restart))
+updater.dispatcher.addHandler(CommandHandler('language', cmd_language))
+updater.dispatcher.addHandler(CommandHandler('gametype', cmd_gametype))
+updater.dispatcher.addHandler(CommandHandler('stats', cmd_stats))
+updater.dispatcher.addHandler(CommandHandler('hints', cmd_hints))
+updater.dispatcher.addHandler(CommandHandler('help', cmd_help))
 updater.dispatcher.addErrorHandler(error)
 
 # Start the Bot
